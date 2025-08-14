@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  neo4j:
+    image: neo4j:5.20
+    restart: unless-stopped
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASS}
+      - NEO4J_server_memory_pagecache_size=2G
+      - NEO4J_PLUGINS=["graph-data-science"]
+    volumes:
+      - neo4j_data:/data
+    ports: ["7687:7687", "7474:7474"]
+
+  mcp_vectordb:
+    build:
+      context: .
+      dockerfile: servers/mcp_vectordb/Dockerfile
+    environment:
+      - NEO4J_URI=${NEO4J_URI}
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASS=${NEO4J_PASS}
+    depends_on: [neo4j]
+    ports: ["7001:8080"]
+
+  mcp_image_retriever:
+    build:
+      context: .
+      dockerfile: servers/mcp_image_retriever/Dockerfile
+    environment:
+      - NEO4J_URI=${NEO4J_URI}
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASS=${NEO4J_PASS}
+    depends_on: [neo4j]
+    ports: ["7002:8080"]
+
+  agent_api:
+    build:
+      context: .
+      dockerfile: servers/agent_api/Dockerfile
+    environment:
+      - MCP_VECTOR_URL=http://mcp_vectordb:8080
+      - MCP_IMAGE_URL=http://mcp_image_retriever:8080
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    depends_on: [mcp_vectordb, mcp_image_retriever]
+    ports: ["7005:8080"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    environment:
+      - AGENT_API=http://agent_api:8080
+    depends_on: [agent_api]
+    ports: ["8501:8501"]
+
+  ingest_book:
+    build:
+      context: .
+      dockerfile: servers/mcp_vectordb/Dockerfile
+    environment:
+      - NEO4J_URI=neo4j://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER}
+      - NEO4J_PASS=${NEO4J_PASS}
+    volumes:
+      - ./books:/books
+    depends_on:
+      - neo4j
+    entrypoint: ["python", "ingestion.py", "/books/mybook.pdf"]
+
+volumes:
+  neo4j_data:
