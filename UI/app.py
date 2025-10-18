@@ -1,7 +1,7 @@
 import streamlit as st, requests, tempfile, pathlib, os
 from dotenv import load_dotenv; load_dotenv()
 
-AGENT_API = os.getenv("AGENT_API", "http://localhost:7000")
+AGENT_API = os.getenv("AGENT_API", "http://localhost:7005")
 NEO4J_URI = os.getenv("NEO4J_URI", "neo4j://neo4j:7687")
 NEO4J_USER= os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS= os.getenv("NEO4J_PASS", "pass")
@@ -16,7 +16,8 @@ with st.sidebar:
         tmp = pathlib.Path(tempfile.mkdtemp())/up.name
         tmp.write_bytes(up.getbuffer())
         st.info("Running ingestion job … this may take a minute.")
-        code = os.system(f"python /app/ingest_book.py {tmp}")
+        ingest_script = pathlib.Path(__file__).resolve().parents[1]/"ingestion.py"
+        code = os.system(f"python3 '{ingest_script}' '{tmp}'")
         st.success("Ingest complete ✓" if code==0 else "Ingest failed!")
 
 # ---------- chat ------------------------------------------------------------

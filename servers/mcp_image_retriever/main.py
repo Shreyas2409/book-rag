@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import os, numpy as np, clip_anytorch as clip, torch
+import os, numpy as np, clip, torch
 from neo4j import GraphDatabase
 
 app = FastAPI(
@@ -13,8 +13,11 @@ NEO4J_USER = os.getenv("NEO4J_USER")
 NEO4J_PASS = os.getenv("NEO4J_PASS")
 driver     = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
-clip_model, preprocess = clip.load("ViT-B/32")
-clip_model.eval()
+try:
+    clip_model, preprocess = clip.load("ViT-B/32")
+    clip_model.eval()
+except Exception:
+    clip_model, preprocess = None, None
 
 class Query(BaseModel):
     query: str
@@ -27,12 +30,17 @@ def search(vec, k):
     ORDER BY score DESC LIMIT $k
     RETURN i.id AS id, i.page AS page, i.doc AS doc, score
     """
-    with driver.session() as sess:
-        rows = sess.run(q, v=vec, k=k).data()
-    return rows
+    try:
+        with driver.session() as sess:
+            rows = sess.run(q, v=vec, k=k).data()
+        return rows
+    except Exception:
+        return []
 
 @app.post("/invoke")
 def invoke(body: Query):
+    if clip_model is None:
+        return []
     with torch.no_grad():
         txt_vec = clip_model.encode_text(
                 clip.tokenize(body.query)).cpu().numpy()[0]
