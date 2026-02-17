@@ -188,7 +188,8 @@ if st.session_state.active_tab == "Chat":
                 )
                 st.markdown(badges, unsafe_allow_html=True)
                 if "trace_id" in item:
-                    st.caption(f"Trace: `{item['trace_id']}` | Chunks: {item.get('chunks_used', '?')}")
+                    steps = item.get('reasoning_steps', 0)
+                    st.caption(f"Trace: `{item['trace_id']}` | Chunks: {item.get('chunks_used', '?')} | ReAct steps: {steps}")
 
     # Chat input
     query = st.chat_input("Ask me anything about your uploaded books …")
@@ -215,11 +216,13 @@ if st.session_state.active_tab == "Chat":
                     eval_scores = data.get("eval_scores")
                     trace_id = data.get("trace_id", "")
                     chunks_used = data.get("chunks_used", 0)
+                    reasoning_steps = data.get("reasoning_steps", 0)
                 except Exception as e:
                     answer = f"Error: {e}"
                     eval_scores = None
                     trace_id = ""
                     chunks_used = 0
+                    reasoning_steps = 0
 
             st.markdown(answer)
 
@@ -231,7 +234,7 @@ if st.session_state.active_tab == "Chat":
                     if isinstance(v, (int, float))
                 )
                 st.markdown(badges, unsafe_allow_html=True)
-                st.caption(f"Trace: `{trace_id}` | Chunks: {chunks_used}")
+                st.caption(f"Trace: `{trace_id}` | Chunks: {chunks_used} | ReAct steps: {reasoning_steps}")
 
         st.session_state.history.append({
             "role": "assistant",
@@ -239,6 +242,7 @@ if st.session_state.active_tab == "Chat":
             "eval_scores": eval_scores,
             "trace_id": trace_id,
             "chunks_used": chunks_used,
+            "reasoning_steps": reasoning_steps,
         })
 
 

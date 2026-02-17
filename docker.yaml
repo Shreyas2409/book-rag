@@ -44,6 +44,7 @@ services:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - EVAL_ENABLED=${EVAL_ENABLED:-true}
       - MAX_HISTORY_TURNS=${MAX_HISTORY_TURNS:-10}
+      - MAX_REACT_STEPS=${MAX_REACT_STEPS:-6}
       - CONTEXT_BUDGET_CHARS=${CONTEXT_BUDGET_CHARS:-12000}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     depends_on: [mcp_vectordb, mcp_image_retriever]

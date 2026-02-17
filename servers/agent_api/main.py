@@ -1,25 +1,31 @@
 """
-Agent API – orchestrates retrieval, LLM generation, context management,
-observability tracing, and eval-judge scoring.
+Agent API – ReAct (Reasoning + Acting) agent for RAG orchestration.
 
-Improvements:
-  • Full observability: every request gets a trace with span timings
-  • Conversation memory with sliding window + summarisation
-  • Parent-chunk expansion for richer context
-  • Eval agent scores every response (async-friendly fallback)
-  • /traces, /metrics, /eval endpoints for the dashboard
+The ReAct pattern forces the LLM to follow an explicit loop:
+  Thought  -> reason about what to do next
+  Action   -> call a tool (text retriever, image retriever)
+  Observation -> read the tool result
+  ... repeat ...
+  Thought  -> "I now have enough information"
+  Final Answer -> synthesised response
+
+This produces more transparent, traceable reasoning compared to
+simple tool-calling, and lets the LLM decide dynamically whether
+to retrieve more context, search for images, or refine its query.
+
+Also includes: observability, conversation memory, eval judge.
 """
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 from langchain_ollama import ChatOllama
-from langchain.tools import BaseTool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain.prompts import ChatPromptTemplate
-import requests, os, traceback, uuid
+from langchain.tools import BaseTool, Tool
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain_core.prompts import PromptTemplate
+import requests, os, traceback, uuid, json, re
 from typing import List, Optional, Dict
 
-# New modules – try direct import first (Docker), then parent dir (local dev)
+# Shared modules
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -39,41 +45,93 @@ VECTOR_URL = os.getenv("MCP_VECTOR_URL", "http://localhost:7001")
 IMAGE_URL  = os.getenv("MCP_IMAGE_URL",  "http://localhost:7002")
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EVAL_ENABLED = os.getenv("EVAL_ENABLED", "true").lower() == "true"
+MAX_REACT_STEPS = int(os.getenv("MAX_REACT_STEPS", "6"))
 
 # ── Tools ─────────────────────────────────────────────────────────────
+# ReAct agents need tools that accept a single string input and return
+# a string observation. We wrap the MCP endpoints accordingly.
 
-class MCPTool(BaseTool):
-    endpoint: str
-    name: str
-    description: str
-
-    def _run(self, query: str, top_k: int = 8):
+def _call_text_retriever(query: str) -> str:
+    """Retrieve text passages from the book. Returns formatted passages."""
+    try:
         r = requests.post(
-            f"{self.endpoint}/invoke",
-            json={"query": query, "top_k": top_k},
+            f"{VECTOR_URL}/invoke",
+            json={"query": query, "top_k": 8},
             timeout=60,
         )
         r.raise_for_status()
-        return r.json()
+        results = r.json()
+        if not results:
+            return "No relevant passages found."
+        # Format as readable observation for the ReAct loop
+        parts = []
+        for i, chunk in enumerate(results):
+            text = chunk.get("text", "")
+            page = chunk.get("page", "?")
+            section = chunk.get("section", "")
+            score = chunk.get("score", 0)
+            header = f"[Passage {i+1} | Page {page}"
+            if section:
+                header += f" | Section: {section}"
+            if score:
+                header += f" | Relevance: {score:.3f}"
+            header += "]"
+            parts.append(f"{header}\n{text}")
+        return "\n---\n".join(parts)
+    except Exception as e:
+        return f"Text retrieval error: {e}"
 
 
-vector_tool = MCPTool(
-    endpoint=VECTOR_URL,
+def _call_image_retriever(query: str) -> str:
+    """Retrieve relevant images/diagrams from the book."""
+    try:
+        r = requests.post(
+            f"{IMAGE_URL}/invoke",
+            json={"query": query, "top_k": 4},
+            timeout=60,
+        )
+        r.raise_for_status()
+        results = r.json()
+        if not results:
+            return "No relevant images found."
+        parts = []
+        for img in results:
+            parts.append(
+                f"Image ID: {img.get('id', '?')}, "
+                f"Page: {img.get('page', '?')}, "
+                f"Document: {img.get('doc', '?')}, "
+                f"Similarity: {img.get('score', 0):.3f}"
+            )
+        return "\n".join(parts)
+    except Exception as e:
+        return f"Image retrieval error: {e}"
+
+
+# Create LangChain Tool objects for the ReAct agent
+text_tool = Tool(
     name="book_text_retriever",
+    func=_call_text_retriever,
     description=(
-        "Fetch relevant text passages from the book. Use for any "
-        "textual or factual questions about book content."
+        "Search the book for relevant text passages. Input should be a "
+        "natural language query describing what information you need. "
+        "Use this for factual questions, summaries, definitions, or any "
+        "text-based content from the book. You can call this multiple "
+        "times with refined queries if the first results are insufficient."
     ),
 )
 
-image_tool = MCPTool(
-    endpoint=IMAGE_URL,
+image_tool = Tool(
     name="book_image_retriever",
+    func=_call_image_retriever,
     description=(
-        "Fetch relevant diagrams, pictures, or figures from the book. "
-        "Use when the user asks about visual content."
+        "Search the book for relevant diagrams, figures, or images. "
+        "Input should describe the visual content you are looking for. "
+        "Use this when the user asks about diagrams, illustrations, "
+        "charts, or visual appearance of something in the book."
     ),
 )
+
+tools = [text_tool, image_tool]
 
 # ── LLM ───────────────────────────────────────────────────────────────
 llm = ChatOllama(
@@ -82,25 +140,75 @@ llm = ChatOllama(
     base_url=OLLAMA_URL,
 )
 
+# ── ReAct Prompt Template ─────────────────────────────────────────────
+# This is the core of ReAct: the prompt structures the Thought/Action/
+# Observation loop explicitly, forcing the LLM to reason before acting.
+
+REACT_PROMPT = PromptTemplate.from_template(
+    """You are an expert book assistant that answers questions by searching
+through uploaded books. You reason step-by-step before giving a final answer.
+
+You have access to the following tools:
+
+{tools}
+
+Tool names: {tool_names}
+
+Use the following format EXACTLY:
+
+Question: the input question you must answer
+Thought: reason about what you need to do. Consider what information you need
+         and which tool would best provide it.
+Action: the tool to use, must be one of [{tool_names}]
+Action Input: the input to pass to the tool
+Observation: the result from the tool
+... (repeat Thought/Action/Action Input/Observation as needed, up to {max_steps} times)
+Thought: I now have enough information to answer the question.
+Final Answer: your comprehensive answer based on the retrieved information.
+              Always cite page numbers when available.
+
+Important rules:
+- Always start with a Thought before taking any Action.
+- If the first retrieval doesn't fully answer the question, refine your query
+  and search again.
+- For questions about visuals, use the image retriever.
+- For text questions, use the text retriever.
+- You may use both tools if the question involves both text and images.
+- Base your Final Answer ONLY on information from the Observations.
+- If no relevant information is found, say so honestly.
+
+Begin!
+
+{context}
+
+Question: {input}
+Thought: {agent_scratchpad}"""
+)
+
+# ── Build the ReAct agent ─────────────────────────────────────────────
 try:
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are an expert search assistant helping users find information "
-         "in books. You have access to text and image retrieval tools. "
-         "Always cite page numbers when available. "
-         "Use the conversation history for context in follow-up questions."),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ])
-    agent = create_tool_calling_agent(llm, tools=[vector_tool, image_tool], prompt=prompt)
-    executor = AgentExecutor(agent=agent, tools=[vector_tool, image_tool], verbose=True)
-except Exception:
-    logger.warning("Tool-calling agent unavailable, will use fallback path")
-    agent = None
+    react_agent = create_react_agent(
+        llm=llm,
+        tools=tools,
+        prompt=REACT_PROMPT,
+    )
+    executor = AgentExecutor(
+        agent=react_agent,
+        tools=tools,
+        verbose=True,
+        max_iterations=MAX_REACT_STEPS,
+        handle_parsing_errors=True,      # gracefully handle malformed output
+        return_intermediate_steps=True,   # capture the Thought/Action/Obs chain
+        early_stopping_method="generate", # let the LLM produce a final answer if it hits max steps
+    )
+    logger.info(f"ReAct agent initialised (max {MAX_REACT_STEPS} steps)")
+except Exception as e:
+    logger.warning(f"ReAct agent unavailable: {e}, will use fallback path")
+    react_agent = None
     executor = None
 
 # ── FastAPI ───────────────────────────────────────────────────────────
-app = FastAPI(title="chat_agent", version="2.0")
+app = FastAPI(title="chat_agent", version="2.1-react")
 
 
 class ChatRequest(BaseModel):
@@ -113,6 +221,7 @@ class ChatResponse(BaseModel):
     trace_id: str
     eval_scores: Optional[Dict[str, float]] = None
     chunks_used: int = 0
+    reasoning_steps: int = 0
 
 
 class EvalRequest(BaseModel):
@@ -121,7 +230,7 @@ class EvalRequest(BaseModel):
     answer: str
 
 
-# ── Chat endpoint (the main one) ─────────────────────────────────────
+# ── Chat endpoint ─────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -135,85 +244,90 @@ def chat(req: ChatRequest):
             summarise_history(memory, ollama_url=OLLAMA_URL)
 
     context_chunks: List[Dict] = []
-    parent_chunks: List[Dict] = []
     answer = ""
+    reasoning_steps = 0
 
-    # ── Step 1: Retrieve ──────────────────────────────────────────────
-    with tracer.span("retrieve_text") as span:
-        try:
-            vec_results = vector_tool._run(req.question, top_k=8)
-            if isinstance(vec_results, list):
-                context_chunks = vec_results
-                # Separate parents from children for expansion
-                for c in context_chunks:
-                    if c.get("chunk_type") == "parent":
-                        parent_chunks.append(c)
-            span.set_metadata(chunks=len(context_chunks))
-        except Exception as e:
-            logger.warning(f"Text retrieval failed: {e}")
-            span.set_metadata(error=str(e))
+    # ── Build context from conversation history ───────────────────────
+    with tracer.span("build_context") as span:
+        context = ""
+        if memory and len(memory.turns) > 1:
+            context = "Previous conversation:\n" + memory.format_for_prompt(max_chars=3000)
+        span.set_metadata(context_chars=len(context))
 
-    with tracer.span("retrieve_images") as span:
-        try:
-            img_results = image_tool._run(req.question, top_k=4)
-            if isinstance(img_results, list):
-                tracer.set_retrieval_stats(
-                    chunks=len(context_chunks),
-                    images=len(img_results),
-                    scores=[
-                        c.get("score", 0.0) for c in context_chunks
-                        if isinstance(c, dict) and "score" in c
-                    ],
-                )
-            span.set_metadata(images=len(img_results) if isinstance(img_results, list) else 0)
-        except Exception as e:
-            logger.warning(f"Image retrieval failed: {e}")
-            img_results = []
-
-    # ── Step 2: Build augmented prompt ────────────────────────────────
-    with tracer.span("build_prompt") as span:
-        augmented_input = build_augmented_prompt(
-            question=req.question,
-            retrieved_chunks=context_chunks,
-            parent_chunks=parent_chunks if parent_chunks else None,
-            memory=memory,
-        )
-        span.set_metadata(prompt_chars=len(augmented_input))
-
-    # ── Step 3: Generate answer ───────────────────────────────────────
-    with tracer.span("llm_generate") as span:
+    # ── Run ReAct agent ───────────────────────────────────────────────
+    with tracer.span("react_agent") as span:
         try:
             if executor is not None:
-                result = executor.invoke({"input": augmented_input})
+                result = executor.invoke({
+                    "input": req.question,
+                    "context": context,
+                    "max_steps": str(MAX_REACT_STEPS),
+                })
                 answer = result.get("output", "")
+
+                # Extract intermediate steps for observability
+                intermediate = result.get("intermediate_steps", [])
+                reasoning_steps = len(intermediate)
+
+                # Collect context chunks from observations
+                for action, observation in intermediate:
+                    if hasattr(action, 'tool') and action.tool == "book_text_retriever":
+                        # Parse observation back to track chunks used
+                        context_chunks.append({
+                            "text": str(observation)[:500],
+                            "tool": action.tool,
+                            "query": action.tool_input,
+                        })
+
+                span.set_metadata(
+                    steps=reasoning_steps,
+                    tools_called=[
+                        {"tool": a.tool, "input": str(a.tool_input)[:100]}
+                        for a, _ in intermediate
+                        if hasattr(a, 'tool')
+                    ],
+                )
+                logger.info(
+                    f"ReAct completed in {reasoning_steps} steps",
+                    extra={"trace_id": tracer.trace.trace_id},
+                )
             else:
-                raise RuntimeError("No executor")
-        except Exception:
+                raise RuntimeError("No ReAct executor available")
+
+        except Exception as e:
+            logger.warning(f"ReAct agent failed: {e}")
             traceback.print_exc()
-            # Fallback: direct LLM call with context
-            try:
-                from langchain_core.messages import HumanMessage
-                resp = llm.invoke([HumanMessage(content=augmented_input)])
-                answer = resp.content
-            except Exception as e2:
-                logger.error(f"LLM generation failed: {e2}")
-                # Last resort: return raw context
-                text_bits = [c.get("text", "") for c in context_chunks if isinstance(c, dict)]
-                img_bits = [
-                    f"Image {i.get('id','?')} on page {i.get('page','?')}"
-                    for i in (img_results if isinstance(img_results, list) else [])
-                    if isinstance(i, dict)
-                ]
-                answer = "\n\n".join([
-                    "Relevant text: " + ("\n".join(text_bits) if text_bits else "<none>"),
-                    "Relevant images: " + ("\n".join(img_bits) if img_bits else "<none>"),
-                ])
+
+            # ── Fallback: manual retrieve + generate ──────────────────
+            with tracer.span("fallback_retrieve"):
+                try:
+                    text_obs = _call_text_retriever(req.question)
+                    context_chunks.append({"text": text_obs, "tool": "fallback"})
+                except Exception:
+                    text_obs = ""
+
+            with tracer.span("fallback_generate"):
+                try:
+                    from langchain_core.messages import HumanMessage
+                    fallback_prompt = (
+                        f"Based on the following context, answer the question.\n\n"
+                        f"Context:\n{text_obs}\n\n"
+                        f"Question: {req.question}\n\n"
+                        f"Answer:"
+                    )
+                    resp = llm.invoke([HumanMessage(content=fallback_prompt)])
+                    answer = resp.content
+                except Exception as e2:
+                    logger.error(f"Fallback generation failed: {e2}")
+                    answer = f"Retrieved context:\n{text_obs}" if text_obs else "Unable to retrieve information."
+
         span.set_metadata(answer_chars=len(answer))
 
+    tracer.set_retrieval_stats(chunks=len(context_chunks))
     memory.add("assistant", answer)
     tracer.set_answer(answer)
 
-    # ── Step 4: Eval judge ────────────────────────────────────────────
+    # ── Eval judge ────────────────────────────────────────────────────
     eval_scores = None
     if EVAL_ENABLED and answer:
         with tracer.span("eval_judge") as span:
@@ -241,6 +355,7 @@ def chat(req: ChatRequest):
         eval_scores={k: v for k, v in eval_scores.items() if k != "reasoning"}
         if eval_scores else None,
         chunks_used=len(context_chunks),
+        reasoning_steps=reasoning_steps,
     )
 
 
@@ -265,11 +380,11 @@ def get_metrics():
     return TraceStore.summary()
 
 
-# ── Eval endpoint (for batch / manual evaluation) ─────────────────────
+# ── Eval endpoint ─────────────────────────────────────────────────────
 
 @app.post("/eval")
 def eval_single(req: EvalRequest):
-    """Run the eval judge on a single Q/A pair (for testing or batch)."""
+    """Run the eval judge on a single Q/A pair."""
     scores = evaluate_response(
         question=req.question,
         context_chunks=req.context_chunks,
@@ -280,4 +395,9 @@ def eval_single(req: EvalRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "eval_enabled": EVAL_ENABLED}
+    return {
+        "status": "ok",
+        "agent_type": "ReAct",
+        "max_steps": MAX_REACT_STEPS,
+        "eval_enabled": EVAL_ENABLED,
+    }
