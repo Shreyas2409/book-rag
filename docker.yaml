@@ -42,6 +42,10 @@ services:
       - MCP_VECTOR_URL=http://mcp_vectordb:8080
       - MCP_IMAGE_URL=http://mcp_image_retriever:8080
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - EVAL_ENABLED=${EVAL_ENABLED:-true}
+      - MAX_HISTORY_TURNS=${MAX_HISTORY_TURNS:-10}
+      - CONTEXT_BUDGET_CHARS=${CONTEXT_BUDGET_CHARS:-12000}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     depends_on: [mcp_vectordb, mcp_image_retriever]
     ports: ["7005:8080"]
     extra_hosts:
