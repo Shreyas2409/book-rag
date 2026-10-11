@@ -19,9 +19,10 @@ Improvements (v3):
   • HyDE query expansion for vague queries
 """
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
 from pydantic import BaseModel
 from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from langchain.tools import BaseTool, Tool
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
@@ -47,6 +48,7 @@ logger = get_logger("agent_api")
 VECTOR_URL = os.getenv("MCP_VECTOR_URL", "http://localhost:7001")
 IMAGE_URL  = os.getenv("MCP_IMAGE_URL",  "http://localhost:7002")
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 EVAL_ENABLED = os.getenv("EVAL_ENABLED", "true").lower() == "true"
 MAX_REACT_STEPS = int(os.getenv("MAX_REACT_STEPS", "6"))
 CORRECTION_THRESHOLD = float(os.getenv("CORRECTION_THRESHOLD", "0.5"))
@@ -198,11 +200,42 @@ image_tool = Tool(
 tools = [text_tool, image_tool]
 
 # ── LLM ───────────────────────────────────────────────────────────────
+# Default LLM is Ollama (local/free). Groq is available as an extra,
+# per-request provider — its API key is supplied by the frontend on each
+# request (header, never env/disk) and is used only to build a throwaway
+# client for that request; it is never logged or persisted.
 llm = ChatOllama(
     model="llama3.1:8b",
     temperature=0,
     base_url=OLLAMA_URL,
 )
+
+
+def build_groq_llm(api_key: str) -> ChatGroq:
+    """Build a ChatGroq client from a caller-supplied API key."""
+    return ChatGroq(
+        model=GROQ_MODEL,
+        temperature=0,
+        api_key=api_key,
+    )
+
+
+def build_react_executor(llm_instance) -> AgentExecutor:
+    """Build a fresh ReAct AgentExecutor bound to the given LLM."""
+    agent = create_react_agent(
+        llm=llm_instance,
+        tools=tools,
+        prompt=REACT_PROMPT,
+    )
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        max_iterations=MAX_REACT_STEPS,
+        handle_parsing_errors=True,
+        return_intermediate_steps=True,
+        early_stopping_method="generate",
+    )
 
 # ── ReAct Prompt Template ─────────────────────────────────────────────
 # This is the core of ReAct: the prompt structures the Thought/Action/
@@ -303,6 +336,7 @@ class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"
     doc_filter: Optional[str] = None  # filter retrieval to a specific book
+    provider: Optional[str] = "ollama"  # "ollama" (default) or "groq"
 
 
 class ChatResponse(BaseModel):
@@ -378,7 +412,7 @@ def _extract_sources(context_chunks: List[Dict]) -> List[Dict]:
 # ── Chat endpoint ─────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, x_groq_api_key: Optional[str] = Header(default=None)):
     # Clear per-request retrieval cache
     _last_retrieval_chunks.clear()
 
@@ -391,6 +425,17 @@ def chat(req: ChatRequest):
             chunks_used=0,
         )
 
+    # Groq is opt-in and per-request: the key travels only in a request
+    # header (never body/query, never logged, never persisted) and is used
+    # to build a throwaway LLM + executor for this request only.
+    use_groq = req.provider == "groq" and bool(x_groq_api_key)
+    if use_groq:
+        active_llm = build_groq_llm(x_groq_api_key)
+        active_executor = build_react_executor(active_llm)
+    else:
+        active_llm = llm
+        active_executor = executor
+
     tracer = Tracer(question=clean_question)
     memory = get_or_create_session(req.session_id)
     memory.add("user", clean_question)
@@ -398,7 +443,10 @@ def chat(req: ChatRequest):
     # Summarise older turns if needed
     if memory.needs_summarisation():
         with tracer.span("summarise_history"):
-            summarise_history(memory, ollama_url=OLLAMA_URL)
+            if use_groq:
+                summarise_history(memory, provider="groq", groq_api_key=x_groq_api_key)
+            else:
+                summarise_history(memory, ollama_url=OLLAMA_URL)
 
     context_chunks: List[Dict] = []
     answer = ""
@@ -415,8 +463,8 @@ def chat(req: ChatRequest):
     # ── Run ReAct agent ───────────────────────────────────────────────
     with tracer.span("react_agent") as span:
         try:
-            if executor is not None:
-                result = executor.invoke({
+            if active_executor is not None:
+                result = active_executor.invoke({
                     "input": clean_question,
                     "context": context,
                     "max_steps": str(MAX_REACT_STEPS),
@@ -475,7 +523,7 @@ def chat(req: ChatRequest):
                         f"Question: {clean_question}\n\n"
                         f"Answer:"
                     )
-                    resp = llm.invoke([HumanMessage(content=fallback_prompt)])
+                    resp = active_llm.invoke([HumanMessage(content=fallback_prompt)])
                     answer = resp.content
                 except Exception as e2:
                     logger.error(f"Fallback generation failed: {e2}")
@@ -499,6 +547,8 @@ def chat(req: ChatRequest):
                     question=clean_question,
                     context_chunks=chunk_texts,
                     answer=answer,
+                    provider="groq" if use_groq else "ollama",
+                    groq_api_key=x_groq_api_key if use_groq else None,
                 )
                 if eval_scores:
                     tracer.set_eval(eval_scores)
@@ -511,7 +561,7 @@ def chat(req: ChatRequest):
     if eval_scores and EVAL_ENABLED:
         numeric_scores = [v for k, v in eval_scores.items() if isinstance(v, (int, float))]
         avg_score = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 1.0
-        if avg_score < CORRECTION_THRESHOLD and executor is not None:
+        if avg_score < CORRECTION_THRESHOLD and active_executor is not None:
             with tracer.span("correction_retry") as span:
                 try:
                     logger.info(
@@ -521,7 +571,7 @@ def chat(req: ChatRequest):
                         f"The previous answer was not good enough. "
                         f"Please search more carefully and answer: {clean_question}"
                     )
-                    result2 = executor.invoke({
+                    result2 = active_executor.invoke({
                         "input": refined_query,
                         "context": context,
                         "max_steps": str(MAX_REACT_STEPS),
@@ -534,6 +584,8 @@ def chat(req: ChatRequest):
                             question=clean_question,
                             context_chunks=retry_chunks,
                             answer=retry_answer,
+                            provider="groq" if use_groq else "ollama",
+                            groq_api_key=x_groq_api_key if use_groq else None,
                         )
                         retry_numeric = [v for k, v in (retry_eval or {}).items() if isinstance(v, (int, float))]
                         retry_avg = sum(retry_numeric) / len(retry_numeric) if retry_numeric else 0

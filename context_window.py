@@ -167,18 +167,61 @@ def expand_to_parents(
     return parents
 
 
-# ── Summarisation helper (uses Ollama) ────────────────────────────────
+# ── Summarisation helpers (Ollama / Groq) ──────────────────────────────
+
+GROQ_SUMMARY_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_SUMMARY_MODEL = os.getenv("GROQ_SUMMARY_MODEL", "llama-3.1-8b-instant")
+
+
+def _summarise_via_ollama(prompt: str, ollama_url: str) -> Optional[str]:
+    import requests as _req
+    try:
+        resp = _req.post(
+            f"{ollama_url}/api/generate",
+            json={"model": "llama3.1:8b", "prompt": prompt, "stream": False,
+                   "options": {"temperature": 0.0, "num_predict": 200}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    except Exception:
+        return None
+
+
+def _summarise_via_groq(prompt: str, api_key: str) -> Optional[str]:
+    """api_key is used only for this single request and is never logged."""
+    import requests as _req
+    try:
+        resp = _req.post(
+            GROQ_SUMMARY_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": GROQ_SUMMARY_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 200,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
 
 def summarise_history(
     memory: ConversationMemory,
     ollama_url: str = None,
+    provider: str = "ollama",
+    groq_api_key: str = None,
 ) -> str:
     """
     Compress older turns into a summary to save tokens.
-    Falls back to simple truncation if Ollama isn't available.
-    """
-    import requests as _req
 
+    provider: "ollama" (default, local/free) or "groq" (requires
+    groq_api_key, supplied per-request by the caller — never read from env
+    or persisted). Falls back to simple truncation if the LLM call fails.
+    """
     ollama_url = ollama_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
     older_turns = memory.turns[:-SUMMARY_TRIGGER]
@@ -195,20 +238,14 @@ def summarise_history(
         "Preserve key questions asked and answers given:\n\n" + text
     )
 
-    try:
-        resp = _req.post(
-            f"{ollama_url}/api/generate",
-            json={"model": "llama3.1:8b", "prompt": prompt, "stream": False,
-                   "options": {"temperature": 0.0, "num_predict": 200}},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        summary = resp.json().get("response", "").strip()
-        if summary:
-            memory.summary = summary
-            return summary
-    except Exception:
-        pass
+    if provider == "groq" and groq_api_key:
+        summary = _summarise_via_groq(prompt, groq_api_key)
+    else:
+        summary = _summarise_via_ollama(prompt, ollama_url)
+
+    if summary:
+        memory.summary = summary
+        return summary
 
     # Fallback: naive truncation
     memory.summary = text[:500] + "..."

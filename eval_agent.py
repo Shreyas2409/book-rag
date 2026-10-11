@@ -21,6 +21,9 @@ logger = get_logger("eval_agent")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EVAL_MODEL = os.getenv("EVAL_MODEL", "llama3.1:8b")
 
+GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_EVAL_MODEL = os.getenv("GROQ_EVAL_MODEL", "llama-3.1-8b-instant")
+
 
 # ── Evaluation prompt templates ───────────────────────────────────────
 
@@ -75,6 +78,34 @@ def _call_ollama(system_prompt: str, user_prompt: str,
         return None
 
 
+def _call_groq(system_prompt: str, user_prompt: str,
+               api_key: str, model: str = None) -> Optional[str]:
+    """Send a chat completion to Groq and return the response text.
+
+    api_key is used only for this single request and is never logged.
+    """
+    model = model or GROQ_EVAL_MODEL
+    try:
+        resp = requests.post(
+            GROQ_BASE_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.0,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Groq eval call failed: {e}")
+        return None
+
+
 def _parse_scores(raw: str) -> Optional[Dict[str, float]]:
     """Extract the JSON scores dict from the LLM response."""
     if not raw:
@@ -122,9 +153,14 @@ def evaluate_response(
     question: str,
     context_chunks: List[str],
     answer: str,
+    provider: str = "ollama",
+    groq_api_key: Optional[str] = None,
 ) -> Optional[Dict[str, float]]:
     """
     Run the judge LLM on a single Q-A pair.
+
+    provider: "ollama" (default, local/free) or "groq" (requires groq_api_key,
+    supplied per-request by the caller — never read from env or persisted).
 
     Returns dict with keys: faithfulness, relevance, completeness,
     hallucination_free, reasoning  (or None on failure).
@@ -141,7 +177,10 @@ def evaluate_response(
     )
 
     logger.info("Running eval judge", extra={"trace_id": ""})
-    raw = _call_ollama(JUDGE_SYSTEM_PROMPT, user_prompt)
+    if provider == "groq" and groq_api_key:
+        raw = _call_groq(JUDGE_SYSTEM_PROMPT, user_prompt, groq_api_key)
+    else:
+        raw = _call_ollama(JUDGE_SYSTEM_PROMPT, user_prompt)
     scores = _parse_scores(raw)
 
     if scores:

@@ -121,6 +121,10 @@ if "active_tab" not in st.session_state:
     st.session_state.active_tab = "Chat"
 if "selected_book" not in st.session_state:
     st.session_state.selected_book = None
+if "llm_provider" not in st.session_state:
+    st.session_state.llm_provider = "ollama"
+if "groq_api_key" not in st.session_state:
+    st.session_state.groq_api_key = ""
 
 # ── Helper functions ──────────────────────────────────────────────────
 
@@ -227,6 +231,31 @@ with st.sidebar:
     st.markdown("## Book RAG v3")
     st.markdown("---")
 
+    # LLM provider — Groq key stays in this session only: it is never
+    # written to disk or logged, and is sent to the agent API as a
+    # request header (not in the JSON body/URL) on each chat call.
+    st.markdown("### LLM Provider")
+    provider_label = st.radio(
+        "Provider",
+        ["Ollama (local, free)", "Groq (cloud, free tier)"],
+        index=0 if st.session_state.llm_provider == "ollama" else 1,
+        label_visibility="collapsed",
+    )
+    st.session_state.llm_provider = "groq" if "Groq" in provider_label else "ollama"
+
+    if st.session_state.llm_provider == "groq":
+        st.session_state.groq_api_key = st.text_input(
+            "Groq API key",
+            value=st.session_state.groq_api_key,
+            type="password",
+            placeholder="gsk_...",
+            help="Kept only in this browser session. Get a free key at console.groq.com.",
+        )
+        if not st.session_state.groq_api_key:
+            st.warning("Enter a Groq API key to use this provider.")
+
+    st.markdown("---")
+
     # File upload
     up = st.file_uploader("Upload a book (PDF/TXT)", type=["pdf", "txt"])
     if up and st.button("Ingest"):
@@ -325,13 +354,19 @@ if st.session_state.active_tab == "Chat":
                     payload = {
                         "question": query,
                         "session_id": st.session_state.session_id,
+                        "provider": st.session_state.llm_provider,
                     }
                     if st.session_state.selected_book:
                         payload["doc_filter"] = st.session_state.selected_book
 
+                    headers = {}
+                    if st.session_state.llm_provider == "groq" and st.session_state.groq_api_key:
+                        headers["X-Groq-Api-Key"] = st.session_state.groq_api_key
+
                     r = requests.post(
                         f"{AGENT_API}/chat",
                         json=payload,
+                        headers=headers,
                         timeout=180,
                     )
                     data = r.json()
