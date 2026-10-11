@@ -11,7 +11,23 @@ app = FastAPI(
 NEO4J_URI  = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USER")
 NEO4J_PASS = os.getenv("NEO4J_PASS")
-driver     = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
+_driver = None
+
+
+def _get_driver():
+    """Lazily connect to Neo4j; never crash the service on a bad/missing URI."""
+    global _driver
+    if _driver is not None:
+        return _driver
+    if not NEO4J_URI:
+        return None
+    try:
+        _driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    except Exception:
+        _driver = None
+    return _driver
+
 
 try:
     clip_model, preprocess = clip.load("ViT-B/32")
@@ -24,6 +40,9 @@ class Query(BaseModel):
     top_k: int = 4
 
 def search(vec, k):
+    driver = _get_driver()
+    if driver is None:
+        return []
     q = """
     MATCH (i:Image)
     WITH i, gds.similarity.cosine(i.embedding, $v) AS score
@@ -45,3 +64,8 @@ def invoke(body: Query):
         txt_vec = clip_model.encode_text(
                 clip.tokenize(body.query)).cpu().numpy()[0]
     return search(txt_vec.tolist(), body.top_k)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok" if _get_driver() else "no_store", "clip": clip_model is not None}

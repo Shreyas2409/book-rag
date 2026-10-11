@@ -1,4 +1,45 @@
+# ── Markdown (preserved from original) ───────────────────────────────
 # Ignore all .md files except README.md
 *.md
 !README.md
+
+# ── macOS ─────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+*.egg
+
+# ── Environment / secrets ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Test / coverage ───────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+*.xml
+
+# ── Tooling ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.tmp
+*.log
+
+# ── Project-specific ─────────────────────────────────────────────────
+chroma/
+traces.jsonl

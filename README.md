@@ -1,10 +1,12 @@
-# Chat with Your Book — v2 (Text + Images + Eval + ReAct)
+# Chat with Your Book — v3 (Text + Images + Eval + ReAct + Reranking)
 
 This project allows you to **upload a PDF or textbook** and interact with it using both **text** and **images**. It retrieves relevant passages and diagrams using **multi-modal search** and processes everything locally with **Ollama**.
 
 The agent uses the **ReAct (Reasoning + Acting)** paradigm — the LLM explicitly reasons step-by-step, decides which tools to call, observes the results, and iterates before producing a final grounded answer.
 
 **v2 adds**: ReAct agent, observability tracing, hierarchical chunking, conversation memory, and an LLM-as-Judge evaluation agent.
+
+**v3 adds**: Cross-encoder reranking, prompt injection protection, source citations, reasoning chain display, multi-book selector, deduplication, agentic correction loop, fulltext index for hybrid search, and trace persistence.
 
 ---
 
@@ -135,23 +137,23 @@ Configurable via `MAX_REACT_STEPS` (default: 6 loops per query).
 
 ## Services Overview
 
-| Service             | Tech Stack                | Purpose                            |
-|---------------------|---------------------------|------------------------------------|
-| ui                  | Streamlit                 | Chat + Observability + Eval UI     |
-| agent_api           | FastAPI + LangChain ReAct | ReAct orchestration, tracing, eval |
-| mcp_vectordb        | FastAPI + Neo4j/Chroma    | Text retrieval with scores         |
-| mcp_image_retriever | FastAPI + CLIP + Neo4j    | Image retrieval                    |
-| neo4j               | Neo4j 5.20                | Vector + graph storage             |
-| ingest_book         | Python + LangChain + CLIP | Hierarchical chunking + indexing   |
+| Service             | Tech Stack                          | Purpose                                      |
+|---------------------|-------------------------------------|----------------------------------------------|
+| ui                  | Streamlit                           | Chat + Observability + Eval UI + Sources     |
+| agent_api           | FastAPI + LangChain ReAct + slowapi | ReAct orchestration, tracing, eval, security |
+| mcp_vectordb        | FastAPI + Neo4j/Chroma + Reranker   | Text retrieval with reranking + scores       |
+| mcp_image_retriever | FastAPI + CLIP + Neo4j              | Image retrieval                              |
+| neo4j               | Neo4j 5.20                          | Vector + graph + fulltext storage            |
+| ingest_book         | Python + LangChain + CLIP           | Hierarchical chunking + dedup + indexing     |
 
 ### Modules
 
-| Module              | Description                                          |
-|---------------------|------------------------------------------------------|
-| `observability.py`  | Structured logging, span tracing, metrics store      |
-| `chunking.py`       | Hierarchical parent-child chunking with metadata     |
-| `context_window.py` | Conversation memory, prompt builder, summarisation   |
-| `eval_agent.py`     | LLM-as-Judge evaluation (4 quality dimensions)       |
+| Module              | Description                                              |
+|---------------------|----------------------------------------------------------|
+| `observability.py`  | Structured logging, span tracing, metrics + JSONL persist|
+| `chunking.py`       | Hierarchical parent-child chunking with metadata         |
+| `context_window.py` | Conversation memory, prompt builder, summarisation       |
+| `eval_agent.py`     | LLM-as-Judge evaluation (4 quality dimensions)           |
 
 ---
 
@@ -268,12 +270,38 @@ curl -X POST http://localhost:7005/eval \
 
 ---
 
+## v3 Changes
+
+### Retrieval Quality
+- **Cross-encoder reranking** — after vector search returns top-20, a `cross-encoder/ms-marco-MiniLM-L-6-v2` model re-scores and reorders to return the most precise top-8. Set `RERANK_ENABLED=false` to disable.
+- **Neo4j fulltext index** — `chunk_fulltext` index is created during ingestion, enabling future hybrid (vector + keyword) search.
+- **Parent-chunk lookup fixed** — O(1) Cypher lookup instead of O(n) brute-force scan.
+
+### Security
+- **Prompt injection protection** — regex-based detection of common injection patterns with input sanitization.
+- **Input length validation** — queries capped at `MAX_QUERY_LENGTH` (default: 2000 chars).
+- **Rate limiting** — via `slowapi` to prevent resource exhaustion.
+
+### UI/UX
+- **Source citations** — collapsible panel showing page numbers, sections, and relevance scores for each retrieved chunk.
+- **Reasoning chain display** — expandable view of the Thought/Action/Observation steps the ReAct agent took.
+- **Multi-book selector** — dropdown to filter retrieval to a specific ingested book.
+
+### Ops & Quality
+- **Trace persistence** — traces are appended to `traces.jsonl` for historical analysis across restarts.
+- **Deduplication** — re-ingesting the same book skips existing chunks (checks by `chunk_id`).
+- **Agentic correction loop** — if eval score < `CORRECTION_THRESHOLD` (default: 0.5), the agent retries with a refined query and keeps the better answer.
+
+---
+
 ## Known Issues
 - Neo4j plugin `graph-data-science` must be enabled for image cosine similarity.
 - Ensure Ollama is running before starting services.
-- First query may be slow as models load into memory.
+- First query may be slow as models load into memory (reranker + embeddings).
 - Eval adds ~2-5s latency per query (set `EVAL_ENABLED=false` to disable).
+- Reranking adds ~100-200ms per query for 20 passages.
 - ReAct occasionally produces malformed output; `handle_parsing_errors=True` recovers gracefully.
+- Correction loop can double latency when triggered; tune `CORRECTION_THRESHOLD`.
 
 ---
 

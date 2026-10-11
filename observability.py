@@ -7,7 +7,7 @@ All trace data is stored in-memory and exposed via a `/traces` API so
 the Streamlit dashboard can pull it in real-time.
 """
 
-import time, uuid, json, logging, threading, os
+import time, uuid, json, logging, threading, os, pathlib
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field, asdict
@@ -170,7 +170,13 @@ class Tracer:
         return self.trace
 
 
-# ── In-memory trace store (thread-safe, ring buffer) ──────────────────
+# ── In-memory trace store (thread-safe, ring buffer) + JSONL persistence ─
+
+TRACE_FILE = os.getenv(
+    "TRACE_FILE",
+    str(pathlib.Path(__file__).resolve().parent / "traces.jsonl"),
+)
+
 
 class TraceStore:
     _lock = threading.Lock()
@@ -183,6 +189,12 @@ class TraceStore:
             cls._traces.append(t)
             if len(cls._traces) > cls._max:
                 cls._traces = cls._traces[-cls._max:]
+        # Persist to JSONL file (non-blocking best-effort)
+        try:
+            with open(TRACE_FILE, "a") as f:
+                f.write(json.dumps(t.to_dict()) + "\n")
+        except Exception:
+            pass  # don't crash if disk write fails
 
     @classmethod
     def all(cls) -> List[dict]:

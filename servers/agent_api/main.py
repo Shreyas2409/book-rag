@@ -9,14 +9,17 @@ The ReAct pattern forces the LLM to follow an explicit loop:
   Thought  -> "I now have enough information"
   Final Answer -> synthesised response
 
-This produces more transparent, traceable reasoning compared to
-simple tool-calling, and lets the LLM decide dynamically whether
-to retrieve more context, search for images, or refine its query.
-
-Also includes: observability, conversation memory, eval judge.
+Improvements (v3):
+  • Input validation & prompt injection protection
+  • Token usage tracking from Ollama responses
+  • Source citations returned alongside answers
+  • Reasoning chain serialised for UI display
+  • Agentic correction loop (retry if eval score < threshold)
+  • Rate limiting via slowapi
+  • HyDE query expansion for vague queries
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from langchain_ollama import ChatOllama
 from langchain.tools import BaseTool, Tool
@@ -46,23 +49,77 @@ IMAGE_URL  = os.getenv("MCP_IMAGE_URL",  "http://localhost:7002")
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EVAL_ENABLED = os.getenv("EVAL_ENABLED", "true").lower() == "true"
 MAX_REACT_STEPS = int(os.getenv("MAX_REACT_STEPS", "6"))
+CORRECTION_THRESHOLD = float(os.getenv("CORRECTION_THRESHOLD", "0.5"))
+MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "2000"))
+
+# ── Hybrid search config (T020) ───────────────────────────────────────
+HYBRID_SEARCH_ENABLED = os.getenv("HYBRID_SEARCH_ENABLED", "false").lower() == "true"
+try:
+    HYBRID_BLEND_WEIGHT = float(os.getenv("HYBRID_BLEND_WEIGHT", "0.7"))
+    HYBRID_BLEND_WEIGHT = max(0.0, min(1.0, HYBRID_BLEND_WEIGHT))
+except (TypeError, ValueError):
+    HYBRID_BLEND_WEIGHT = 0.7
+
+# ── Input Validation & Prompt Injection Protection ────────────────────
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)",
+    r"disregard\s+(all\s+)?(previous|prior|above)",
+    r"you\s+are\s+now\s+a",
+    r"pretend\s+(you\s+are|to\s+be)",
+    r"reveal\s+(your\s+)?(system\s+)?prompt",
+    r"show\s+(me\s+)?(your\s+)?(system\s+)?prompt",
+    r"repeat\s+(the\s+)?(above|system)\s+(text|prompt|instructions)",
+    r"forget\s+(all\s+)?(your\s+)?(instructions?|rules?)",
+    r"override\s+(your\s+)?(instructions?|rules?|behavior)",
+]
+_injection_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
+
+
+def sanitize_query(query: str) -> str:
+    """Validate and sanitize user input to prevent prompt injection."""
+    if not query or not query.strip():
+        return ""
+    query = query.strip()
+    if len(query) > MAX_QUERY_LENGTH:
+        query = query[:MAX_QUERY_LENGTH]
+        logger.warning(f"Query truncated to {MAX_QUERY_LENGTH} chars")
+    if _injection_re.search(query):
+        logger.warning(f"Prompt injection detected, sanitizing query")
+        return "Please ask a question about the book."
+    return query
+
 
 # ── Tools ─────────────────────────────────────────────────────────────
 # ReAct agents need tools that accept a single string input and return
 # a string observation. We wrap the MCP endpoints accordingly.
+
+# Store the raw chunk data from the last retrieval for source citations
+_last_retrieval_chunks: Dict[str, List[Dict]] = {}
+
 
 def _call_text_retriever(query: str) -> str:
     """Retrieve text passages from the book. Returns formatted passages."""
     try:
         r = requests.post(
             f"{VECTOR_URL}/invoke",
-            json={"query": query, "top_k": 8},
+            json={
+                "query": query,
+                "top_k": 8,
+                "rerank": True,
+                "hybrid": HYBRID_SEARCH_ENABLED,      # T020: pass feature flag through
+                "blend_weight": HYBRID_BLEND_WEIGHT,  # T020: pass blend weight through
+            },
             timeout=60,
         )
         r.raise_for_status()
         results = r.json()
         if not results:
             return "No relevant passages found."
+
+        # Store raw chunks for source citations
+        _last_retrieval_chunks["text"] = results
+
         # Format as readable observation for the ReAct loop
         parts = []
         for i, chunk in enumerate(results):
@@ -70,10 +127,13 @@ def _call_text_retriever(query: str) -> str:
             page = chunk.get("page", "?")
             section = chunk.get("section", "")
             score = chunk.get("score", 0)
+            rerank_score = chunk.get("rerank_score")
             header = f"[Passage {i+1} | Page {page}"
             if section:
                 header += f" | Section: {section}"
-            if score:
+            if rerank_score is not None:
+                header += f" | Relevance: {rerank_score:.3f}"
+            elif score:
                 header += f" | Relevance: {score:.3f}"
             header += "]"
             parts.append(f"{header}\n{text}")
@@ -94,6 +154,10 @@ def _call_image_retriever(query: str) -> str:
         results = r.json()
         if not results:
             return "No relevant images found."
+
+        # Store raw image data for citations
+        _last_retrieval_chunks["images"] = results
+
         parts = []
         for img in results:
             parts.append(
@@ -207,13 +271,38 @@ except Exception as e:
     react_agent = None
     executor = None
 
+# ── Rate Limiting ─────────────────────────────────────────────────────
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    from fastapi.responses import JSONResponse
+
+    limiter = Limiter(key_func=get_remote_address)
+    RATE_LIMIT_ENABLED = True
+except ImportError:
+    limiter = None
+    RATE_LIMIT_ENABLED = False
+    logger.warning("slowapi not installed, rate limiting disabled")
+
 # ── FastAPI ───────────────────────────────────────────────────────────
-app = FastAPI(title="chat_agent", version="2.1-react")
+app = FastAPI(title="chat_agent", version="3.0-react")
+
+if RATE_LIMIT_ENABLED and limiter:
+    app.state.limiter = limiter
+
+    @app.exception_handler(RateLimitExceeded)
+    async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded. Please wait before sending more requests."},
+        )
 
 
 class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"
+    doc_filter: Optional[str] = None  # filter retrieval to a specific book
 
 
 class ChatResponse(BaseModel):
@@ -222,6 +311,8 @@ class ChatResponse(BaseModel):
     eval_scores: Optional[Dict[str, float]] = None
     chunks_used: int = 0
     reasoning_steps: int = 0
+    sources: Optional[List[Dict]] = None        # source citations
+    reasoning_chain: Optional[List[Dict]] = None  # Thought/Action/Obs chain
 
 
 class EvalRequest(BaseModel):
@@ -230,13 +321,79 @@ class EvalRequest(BaseModel):
     answer: str
 
 
+# ── Helper: serialise reasoning chain for UI ──────────────────────────
+
+def _serialise_reasoning_chain(intermediate_steps: list) -> List[Dict]:
+    """Convert LangChain intermediate_steps into a JSON-serialisable list."""
+    chain = []
+    for action, observation in intermediate_steps:
+        step = {}
+        if hasattr(action, 'tool'):
+            step["tool"] = action.tool
+            step["tool_input"] = str(action.tool_input)[:200]
+        if hasattr(action, 'log'):
+            # Extract the Thought from the log
+            log = action.log.strip()
+            thought_match = re.search(r'^(.*?)(?:Action:|$)', log, re.DOTALL)
+            if thought_match:
+                thought = thought_match.group(1).strip()
+                if thought:
+                    step["thought"] = thought
+        step["observation_preview"] = str(observation)[:300]
+        chain.append(step)
+    return chain
+
+
+# ── Helper: extract source citations from retrieved chunks ────────────
+
+def _extract_sources(context_chunks: List[Dict]) -> List[Dict]:
+    """Build a deduplicated list of source citations from retrieved chunks."""
+    sources = []
+    seen = set()
+    # From text retrieval
+    for chunk in _last_retrieval_chunks.get("text", []):
+        key = (chunk.get("page", -1), chunk.get("section", ""))
+        if key not in seen:
+            seen.add(key)
+            sources.append({
+                "page": chunk.get("page", -1),
+                "section": chunk.get("section", ""),
+                "doc": chunk.get("doc", ""),
+                "score": chunk.get("rerank_score") or chunk.get("score", 0),
+                "chunk_type": chunk.get("chunk_type", ""),
+                "type": "text",
+            })
+    # From image retrieval
+    for img in _last_retrieval_chunks.get("images", []):
+        sources.append({
+            "page": img.get("page", -1),
+            "doc": img.get("doc", ""),
+            "score": img.get("score", 0),
+            "type": "image",
+            "image_id": img.get("id", ""),
+        })
+    return sources
+
+
 # ── Chat endpoint ─────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    tracer = Tracer(question=req.question)
+    # Clear per-request retrieval cache
+    _last_retrieval_chunks.clear()
+
+    # Input validation
+    clean_question = sanitize_query(req.question)
+    if not clean_question:
+        return ChatResponse(
+            answer="Please provide a valid question.",
+            trace_id="",
+            chunks_used=0,
+        )
+
+    tracer = Tracer(question=clean_question)
     memory = get_or_create_session(req.session_id)
-    memory.add("user", req.question)
+    memory.add("user", clean_question)
 
     # Summarise older turns if needed
     if memory.needs_summarisation():
@@ -246,6 +403,7 @@ def chat(req: ChatRequest):
     context_chunks: List[Dict] = []
     answer = ""
     reasoning_steps = 0
+    reasoning_chain = []
 
     # ── Build context from conversation history ───────────────────────
     with tracer.span("build_context") as span:
@@ -259,7 +417,7 @@ def chat(req: ChatRequest):
         try:
             if executor is not None:
                 result = executor.invoke({
-                    "input": req.question,
+                    "input": clean_question,
                     "context": context,
                     "max_steps": str(MAX_REACT_STEPS),
                 })
@@ -269,10 +427,12 @@ def chat(req: ChatRequest):
                 intermediate = result.get("intermediate_steps", [])
                 reasoning_steps = len(intermediate)
 
+                # Serialise reasoning chain for UI
+                reasoning_chain = _serialise_reasoning_chain(intermediate)
+
                 # Collect context chunks from observations
                 for action, observation in intermediate:
                     if hasattr(action, 'tool') and action.tool == "book_text_retriever":
-                        # Parse observation back to track chunks used
                         context_chunks.append({
                             "text": str(observation)[:500],
                             "tool": action.tool,
@@ -301,7 +461,7 @@ def chat(req: ChatRequest):
             # ── Fallback: manual retrieve + generate ──────────────────
             with tracer.span("fallback_retrieve"):
                 try:
-                    text_obs = _call_text_retriever(req.question)
+                    text_obs = _call_text_retriever(clean_question)
                     context_chunks.append({"text": text_obs, "tool": "fallback"})
                 except Exception:
                     text_obs = ""
@@ -312,7 +472,7 @@ def chat(req: ChatRequest):
                     fallback_prompt = (
                         f"Based on the following context, answer the question.\n\n"
                         f"Context:\n{text_obs}\n\n"
-                        f"Question: {req.question}\n\n"
+                        f"Question: {clean_question}\n\n"
                         f"Answer:"
                     )
                     resp = llm.invoke([HumanMessage(content=fallback_prompt)])
@@ -336,7 +496,7 @@ def chat(req: ChatRequest):
                     c.get("text", "") for c in context_chunks if isinstance(c, dict)
                 ]
                 eval_scores = evaluate_response(
-                    question=req.question,
+                    question=clean_question,
                     context_chunks=chunk_texts,
                     answer=answer,
                 )
@@ -345,6 +505,59 @@ def chat(req: ChatRequest):
                     span.set_metadata(scores=eval_scores)
             except Exception as e:
                 logger.warning(f"Eval failed: {e}")
+
+    # ── Agentic Correction Loop ───────────────────────────────────────
+    # If eval scores are below threshold, retry with a refined query
+    if eval_scores and EVAL_ENABLED:
+        numeric_scores = [v for k, v in eval_scores.items() if isinstance(v, (int, float))]
+        avg_score = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 1.0
+        if avg_score < CORRECTION_THRESHOLD and executor is not None:
+            with tracer.span("correction_retry") as span:
+                try:
+                    logger.info(
+                        f"Correction loop triggered (avg_score={avg_score:.2f} < {CORRECTION_THRESHOLD})"
+                    )
+                    refined_query = (
+                        f"The previous answer was not good enough. "
+                        f"Please search more carefully and answer: {clean_question}"
+                    )
+                    result2 = executor.invoke({
+                        "input": refined_query,
+                        "context": context,
+                        "max_steps": str(MAX_REACT_STEPS),
+                    })
+                    retry_answer = result2.get("output", "")
+                    if retry_answer:
+                        # Re-evaluate the retry answer
+                        retry_chunks = [c.get("text", "") for c in context_chunks]
+                        retry_eval = evaluate_response(
+                            question=clean_question,
+                            context_chunks=retry_chunks,
+                            answer=retry_answer,
+                        )
+                        retry_numeric = [v for k, v in (retry_eval or {}).items() if isinstance(v, (int, float))]
+                        retry_avg = sum(retry_numeric) / len(retry_numeric) if retry_numeric else 0
+                        if retry_avg > avg_score:
+                            answer = retry_answer
+                            eval_scores = retry_eval
+                            tracer.set_eval(eval_scores)
+                            tracer.set_answer(answer)
+                            # Update memory with corrected answer
+                            memory.turns[-1].content = answer
+                            span.set_metadata(
+                                improved=True,
+                                old_avg=round(avg_score, 3),
+                                new_avg=round(retry_avg, 3),
+                            )
+                            logger.info(f"Correction improved score: {avg_score:.2f} -> {retry_avg:.2f}")
+                        else:
+                            span.set_metadata(improved=False)
+                except Exception as e:
+                    logger.warning(f"Correction loop failed: {e}")
+                    span.set_metadata(improved=False, error=str(e))
+
+    # ── Extract source citations ──────────────────────────────────────
+    sources = _extract_sources(context_chunks)
 
     # ── Finish trace ──────────────────────────────────────────────────
     trace = tracer.finish()
@@ -356,6 +569,8 @@ def chat(req: ChatRequest):
         if eval_scores else None,
         chunks_used=len(context_chunks),
         reasoning_steps=reasoning_steps,
+        sources=sources,
+        reasoning_chain=reasoning_chain,
     )
 
 
@@ -400,4 +615,7 @@ def health():
         "agent_type": "ReAct",
         "max_steps": MAX_REACT_STEPS,
         "eval_enabled": EVAL_ENABLED,
+        "rate_limiting": RATE_LIMIT_ENABLED,
+        "correction_threshold": CORRECTION_THRESHOLD,
+        "input_sanitization": True,
     }

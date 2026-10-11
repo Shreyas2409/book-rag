@@ -3,11 +3,13 @@ Ingestion pipeline with improved chunking + observability.
 
 Run:  python ingestion.py <path-to-pdf-or-txt>
 
-Changes from original:
+Improvements (v3):
   • Hierarchical chunking (parent 2000 / child 500) with metadata enrichment
   • Structured JSON logging via the observability module
   • Stores both parent and child chunks in the vector store
   • Timing spans for each pipeline phase
+  • Deduplication: uses MERGE to avoid duplicate chunks on re-ingestion
+  • Creates Neo4j fulltext index for hybrid search support
 """
 
 import os, sys, uuid, pathlib, io
@@ -95,15 +97,50 @@ all_chunks = child_chunks + parent_chunks
 
 with tracer.span("store_vectors") as span:
     try:
-        vector_store = Neo4jVector.from_documents(
-            all_chunks, embeddings,
-            url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS,
-            node_label="Chunk",
-            index_name="books",
-            text_node_properties=["text"],
-        )
-        span.set_metadata(backend="neo4j")
-        logger.info("Stored chunks in Neo4j vector index 'books'.")
+        # ── Deduplication: check existing chunk_ids and skip duplicates ──
+        from neo4j import GraphDatabase as _GDB
+        existing_ids = set()
+        try:
+            _dedup_driver = _GDB.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+            with _dedup_driver.session() as sess:
+                records = sess.run(
+                    "MATCH (c:Chunk) WHERE c.doc = $doc RETURN c.chunk_id AS cid",
+                    doc=PDF.name,
+                ).data()
+                existing_ids = {r["cid"] for r in records if r.get("cid")}
+            _dedup_driver.close()
+        except Exception:
+            pass  # Neo4j not available yet, skip dedup check
+
+        if existing_ids:
+            before = len(all_chunks)
+            all_chunks = [
+                c for c in all_chunks
+                if c.metadata.get("chunk_id") not in existing_ids
+            ]
+            skipped = before - len(all_chunks)
+            if skipped > 0:
+                logger.info(f"Deduplication: skipped {skipped} existing chunks")
+            span.set_metadata(skipped_duplicates=skipped)
+
+        if all_chunks:
+            vector_store = Neo4jVector.from_documents(
+                all_chunks, embeddings,
+                url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS,
+                node_label="Chunk",
+                index_name="books",
+                # Neo4jVector.__init__ takes `text_node_property` (singular
+                # str), not `text_node_properties` — the plural kwarg raised
+                # TypeError on every call, silently falling back to Chroma.
+                text_node_property="text",
+            )
+
+            span.set_metadata(backend="neo4j", chunks_stored=len(all_chunks))
+            logger.info(f"Stored {len(all_chunks)} chunks in Neo4j vector index 'books'.")
+        else:
+            logger.info("All chunks already exist in Neo4j, nothing to store.")
+            span.set_metadata(backend="neo4j", chunks_stored=0)
+
     except Exception as e:
         logger.warning(f"Neo4j unavailable, using local Chroma: {e}")
         vector_store = Chroma.from_documents(
@@ -112,9 +149,51 @@ with tracer.span("store_vectors") as span:
             persist_directory=CHROMA_DIR,
         )
         vector_store.persist()
-        span.set_metadata(backend="chroma")
+        span.set_metadata(backend="chroma", chunks_stored=len(all_chunks))
 
-# ── Image embeddings (unchanged) ──────────────────────────────────────
+# ── Create fulltext index for hybrid search ───────────────────────────
+with tracer.span("create_fulltext_index") as span:
+    try:
+        from neo4j import GraphDatabase as _GDB2
+        _idx_driver = _GDB2.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+        with _idx_driver.session() as sess:
+            # Create fulltext index on Chunk text for keyword/BM25 search
+            sess.run(
+                "CREATE FULLTEXT INDEX chunk_fulltext IF NOT EXISTS "
+                "FOR (c:Chunk) ON EACH [c.text]"
+            )
+            logger.info("Fulltext index 'chunk_fulltext' created/verified.")
+            span.set_metadata(index="chunk_fulltext", status="ok")
+        _idx_driver.close()
+    except Exception as e:
+        logger.warning(f"Fulltext index creation skipped: {e}")
+        span.set_metadata(index="chunk_fulltext", status="skipped", error=str(e))
+
+# ── Trigger BM25 index refresh (best-effort, non-blocking) ───────────
+# FR-007: after new chunks are stored, notify mcp_vectordb to rebuild
+# its in-memory BM25 index. Failures are caught and logged — they do NOT
+# fail ingestion (the BM25 index will be rebuilt on the next service restart).
+with tracer.span("bm25_refresh_notify") as span:
+    try:
+        import requests as _requests
+        MCP_VECTOR_URL = os.getenv("MCP_VECTOR_URL", "http://localhost:7001")
+        resp = _requests.post(f"{MCP_VECTOR_URL}/bm25/refresh", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        span.set_metadata(
+            status=data.get("status", "unknown"),
+            chunks_indexed=data.get("chunks_indexed", 0),
+            duration_ms=data.get("duration_ms", 0),
+        )
+        logger.info(
+            f"BM25 index refreshed: {data.get('chunks_indexed', 0)} chunks "
+            f"in {data.get('duration_ms', 0):.1f}ms"
+        )
+    except Exception as e:
+        logger.warning(f"BM25 index refresh notify failed (non-fatal): {e}")
+        span.set_metadata(status="error", error=str(e))
+
+# ── Image embeddings ──────────────────────────────────────────────────
 import fitz
 import clip
 from PIL import Image
@@ -134,8 +213,25 @@ if PDF.suffix.lower() == ".pdf" and clip_model is not None:
             doc = fitz.open(str(PDF))
             driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
             img_count = 0
+            img_skipped = 0
             with driver.session() as sess:
+                # Get existing image IDs for this doc to avoid duplicates
+                existing_img_pages = set()
+                try:
+                    records = sess.run(
+                        "MATCH (i:Image) WHERE i.doc = $doc RETURN i.page AS page",
+                        doc=str(PDF.name),
+                    ).data()
+                    existing_img_pages = {r["page"] for r in records if r.get("page")}
+                except Exception:
+                    pass
+
                 for page in doc:
+                    # Skip if images from this page already exist
+                    if (page.number + 1) in existing_img_pages:
+                        img_skipped += 1
+                        continue
+
                     for img in page.get_images(full=True):
                         xref = img[0]
                         base = doc.extract_image(xref)
@@ -155,8 +251,8 @@ if PDF.suffix.lower() == ".pdf" and clip_model is not None:
                             doc=str(PDF.name),
                         )
                         img_count += 1
-            span.set_metadata(images_stored=img_count)
-            logger.info(f"Stored {img_count} image embeddings in Neo4j.")
+            span.set_metadata(images_stored=img_count, images_skipped=img_skipped)
+            logger.info(f"Stored {img_count} image embeddings in Neo4j (skipped {img_skipped} existing pages).")
         except Exception as e:
             logger.warning(f"Image ingestion skipped: {e}")
 

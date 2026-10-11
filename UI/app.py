@@ -1,12 +1,15 @@
 """
 Streamlit UI – Chat with your Book + Observability Dashboard + Eval Scores.
 
-Improvements:
+Improvements (v3):
   • Shows eval scores (faithfulness, relevance, etc.) for each response
   • Observability sidebar with live metrics and recent traces
   • Trace detail view with span waterfall
   • Session-aware chat with conversation memory
   • Cleaner layout with status indicators
+  • Source citations with page numbers and relevance scores
+  • ReAct reasoning chain display (Thought/Action/Observation)
+  • Multi-book selector for filtering retrieval
 """
 
 import streamlit as st
@@ -25,6 +28,7 @@ AGENT_API  = os.getenv("AGENT_API", "http://localhost:7005")
 NEO4J_URI  = os.getenv("NEO4J_URI", "neo4j://neo4j:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "pass")
+VECTOR_URL = os.getenv("MCP_VECTOR_URL", "http://localhost:7001")
 
 # ── Page config ───────────────────────────────────────────────────────
 st.set_page_config(
@@ -75,6 +79,36 @@ st.markdown("""
 }
 .metric-card h3 { margin: 0; font-size: 1.8em; }
 .metric-card p  { margin: 0; font-size: 0.85em; opacity: 0.85; }
+
+/* Source citations */
+.source-item {
+    display: flex;
+    align-items: center;
+    padding: 6px 12px;
+    margin: 3px 0;
+    border-radius: 8px;
+    background: #f0f2f6;
+    font-size: 0.85em;
+}
+.source-item .source-icon { margin-right: 8px; }
+.source-item .source-score {
+    margin-left: auto;
+    font-weight: 600;
+    color: #4a4a4a;
+}
+
+/* Reasoning chain */
+.reasoning-step {
+    padding: 8px 12px;
+    margin: 4px 0;
+    border-left: 3px solid #667eea;
+    background: #f8f9fc;
+    border-radius: 0 8px 8px 0;
+    font-size: 0.85em;
+}
+.reasoning-step .step-thought { color: #4a4a4a; font-style: italic; }
+.reasoning-step .step-action { color: #667eea; font-weight: 600; }
+.reasoning-step .step-obs { color: #6c757d; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,6 +119,8 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = uuid.uuid4().hex[:12]
 if "active_tab" not in st.session_state:
     st.session_state.active_tab = "Chat"
+if "selected_book" not in st.session_state:
+    st.session_state.selected_book = None
 
 # ── Helper functions ──────────────────────────────────────────────────
 
@@ -123,9 +159,72 @@ def fetch_trace(trace_id):
         return None
 
 
+def fetch_documents():
+    """Fetch list of ingested documents from the vector DB."""
+    try:
+        r = requests.get(f"{VECTOR_URL}/documents", timeout=5)
+        return r.json()
+    except Exception:
+        return []
+
+
+def render_sources(sources):
+    """Render source citations as styled HTML."""
+    if not sources:
+        return
+    with st.expander("📄 Sources", expanded=False):
+        for i, src in enumerate(sources):
+            icon = "📝" if src.get("type") == "text" else "🖼️"
+            page = src.get("page", "?")
+            section = src.get("section", "")
+            score = src.get("score", 0)
+            doc = src.get("doc", "")
+
+            label = f"Page {page}"
+            if section:
+                label += f" | {section}"
+            if doc:
+                label += f" | {doc}"
+
+            st.markdown(
+                f'<div class="source-item">'
+                f'<span class="source-icon">{icon}</span>'
+                f'{label}'
+                f'<span class="source-score">{score:.3f}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+
+def render_reasoning_chain(chain):
+    """Render the ReAct reasoning chain as styled steps."""
+    if not chain:
+        return
+    with st.expander(f"💭 Reasoning ({len(chain)} steps)", expanded=False):
+        for i, step in enumerate(chain):
+            thought = step.get("thought", "")
+            tool = step.get("tool", "")
+            tool_input = step.get("tool_input", "")
+            obs_preview = step.get("observation_preview", "")
+
+            parts = [f"**Step {i+1}**"]
+            if thought:
+                parts.append(f'<div class="step-thought">💬 {thought}</div>')
+            if tool:
+                parts.append(f'<div class="step-action">🔧 {tool}("{tool_input}")</div>')
+            if obs_preview:
+                short_obs = obs_preview[:150] + ("…" if len(obs_preview) > 150 else "")
+                parts.append(f'<div class="step-obs">👁️ {short_obs}</div>')
+
+            st.markdown(
+                f'<div class="reasoning-step">{"".join(parts)}</div>',
+                unsafe_allow_html=True,
+            )
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## Book RAG v2")
+    st.markdown("## Book RAG v3")
     st.markdown("---")
 
     # File upload
@@ -148,6 +247,17 @@ with st.sidebar:
             st.success("Ingest complete!")
         else:
             st.error("Ingestion failed. Check logs.")
+
+    st.markdown("---")
+
+    # Multi-book selector
+    docs = fetch_documents()
+    if docs:
+        book_options = ["All books"] + docs
+        selected = st.selectbox("📚 Filter by book", book_options, index=0)
+        st.session_state.selected_book = None if selected == "All books" else selected
+    else:
+        st.caption("No books ingested yet.")
 
     st.markdown("---")
 
@@ -187,6 +297,15 @@ if st.session_state.active_tab == "Chat":
                     if isinstance(v, (int, float))
                 )
                 st.markdown(badges, unsafe_allow_html=True)
+
+                # Show source citations
+                if "sources" in item and item["sources"]:
+                    render_sources(item["sources"])
+
+                # Show reasoning chain
+                if "reasoning_chain" in item and item["reasoning_chain"]:
+                    render_reasoning_chain(item["reasoning_chain"])
+
                 if "trace_id" in item:
                     steps = item.get('reasoning_steps', 0)
                     st.caption(f"Trace: `{item['trace_id']}` | Chunks: {item.get('chunks_used', '?')} | ReAct steps: {steps}")
@@ -203,12 +322,16 @@ if st.session_state.active_tab == "Chat":
         with st.chat_message("assistant"):
             with st.spinner("Thinking …"):
                 try:
+                    payload = {
+                        "question": query,
+                        "session_id": st.session_state.session_id,
+                    }
+                    if st.session_state.selected_book:
+                        payload["doc_filter"] = st.session_state.selected_book
+
                     r = requests.post(
                         f"{AGENT_API}/chat",
-                        json={
-                            "question": query,
-                            "session_id": st.session_state.session_id,
-                        },
+                        json=payload,
                         timeout=180,
                     )
                     data = r.json()
@@ -217,12 +340,16 @@ if st.session_state.active_tab == "Chat":
                     trace_id = data.get("trace_id", "")
                     chunks_used = data.get("chunks_used", 0)
                     reasoning_steps = data.get("reasoning_steps", 0)
+                    sources = data.get("sources", [])
+                    reasoning_chain = data.get("reasoning_chain", [])
                 except Exception as e:
                     answer = f"Error: {e}"
                     eval_scores = None
                     trace_id = ""
                     chunks_used = 0
                     reasoning_steps = 0
+                    sources = []
+                    reasoning_chain = []
 
             st.markdown(answer)
 
@@ -234,6 +361,16 @@ if st.session_state.active_tab == "Chat":
                     if isinstance(v, (int, float))
                 )
                 st.markdown(badges, unsafe_allow_html=True)
+
+            # Show source citations
+            if sources:
+                render_sources(sources)
+
+            # Show reasoning chain
+            if reasoning_chain:
+                render_reasoning_chain(reasoning_chain)
+
+            if trace_id:
                 st.caption(f"Trace: `{trace_id}` | Chunks: {chunks_used} | ReAct steps: {reasoning_steps}")
 
         st.session_state.history.append({
@@ -243,6 +380,8 @@ if st.session_state.active_tab == "Chat":
             "trace_id": trace_id,
             "chunks_used": chunks_used,
             "reasoning_steps": reasoning_steps,
+            "sources": sources,
+            "reasoning_chain": reasoning_chain,
         })
 
 
